@@ -49,6 +49,12 @@ if (!fs.existsSync(javaPath)) {
   process.exit(1);
 }
 
+// 序数那一族在另一个类里：播报文案由 `VoiceOrderService` 拼，`VoiceSlotParser` 不管它。
+const servicePath = path.resolve(
+  path.dirname(javaPath),
+  process.env.AIDRUN_BACKEND_VOICE_SERVICE ?? '../service/VoiceOrderService.java'
+);
+
 // ---------------------------------------------------------------- 后端
 
 // `private static final Pattern INTENT_CONFIRM = Pattern.compile("…" + "…");`
@@ -138,11 +144,69 @@ for (const { name, intent, words } of tables) {
   }
 }
 
+// ------------------------------------------------- 序数：方向与上面三张表相反
+//
+// 上面查的是「本地认的词，后端会不会判成别的」；这里查的是「**后端念给用户的词，本地认不认得**」。
+// 方向反过来是因为**教用户说什么由后端决定** —— 候选消歧那一轮播的是后端的 `ttsText`
+// （「找到3个地点，请说第几个。第一个，…」），而用户的回答由客户端本地匹配。
+// 系统念一个词、本地认另一个，盲人照着念却不生效，而屏幕上没有任何东西能让他发现。
+//
+// 所以这一条是**覆盖检查**，不是子集检查：后端 ORDINALS 里的每一个都必须能被本地认出来。
+// 本地多认几种写法（阿拉伯数字）是好事，不报。
+const ordinalProblems = [];
+if (!fs.existsSync(servicePath)) {
+  console.error(`[voice-intent] 读不到后端播报文案来源：${servicePath}`);
+  console.error('[voice-intent] 这不算通过 —— 序数是后端念给用户听的词，必须拿它的定义来对。');
+  process.exit(1);
+}
+const ordinalsDecl = fs
+  .readFileSync(servicePath, 'utf8')
+  .match(/String\[\]\s+ORDINALS\s*=\s*\{([^}]*)\}/);
+if (!ordinalsDecl) {
+  console.error(`[voice-intent] 在 ${servicePath} 里找不到 ORDINALS，后端的写法可能变了。`);
+  process.exit(1);
+}
+const backendOrdinals = [...ordinalsDecl[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+
+// 前端：`ordinalForms` 是 `[[String]]`，逐行一组，下标即候选下标。
+const formsBlock = swift.match(/let ordinalForms:\s*\[\[String\]\]\s*=\s*\[([\s\S]*?)\n\s*\]/);
+if (!formsBlock) {
+  console.error(`[voice-intent] 在 ${swiftPath} 里解不出 ordinalForms，格式可能变了。`);
+  process.exit(1);
+}
+const frontendOrdinalForms = [...formsBlock[1].matchAll(/\[([^\]]*)\]/g)].map((row) =>
+  [...row[1].matchAll(/"([^"]+)"/g)].map((m) => m[1])
+);
+
+if (!backendOrdinals.length || !frontendOrdinalForms.length) {
+  console.error(
+    `[voice-intent] 序数解析异常：后端 ${backendOrdinals.length} 个、前端 ${frontendOrdinalForms.length} 组。`
+  );
+  process.exit(1);
+}
+
+backendOrdinals.forEach((spoken, index) => {
+  const forms = frontendOrdinalForms[index];
+  if (!forms) {
+    ordinalProblems.push(`后端念第 ${index + 1} 个候选用「${spoken}」，前端 ordinalForms 没有这一组`);
+    return;
+  }
+  // 前端 `ordinalIndex` 用的是包含匹配，这里照同一套判：本地任一写法是后端那句的子串即可。
+  if (!forms.some((form) => spoken.includes(form))) {
+    ordinalProblems.push(
+      `后端念「${spoken}」（第 ${index + 1} 个），而前端第 ${index + 1} 组只认 ${forms
+        .map((f) => `「${f}」`)
+        .join('、')}`
+    );
+  }
+});
+
 const total = tables.reduce((n, t) => n + t.words.length, 0);
 console.log(
   `[voice-intent] 前端本地直通表 ${total} 个词（${tables
     .map((t) => `${t.name} ${t.words.length}`)
-    .join('、')}），逐词过了后端 5 条正则。`
+    .join('、')}），逐词过了后端 5 条正则；` +
+    `序数 ${backendOrdinals.length} 个（${backendOrdinals.join('/')}）逐个查了本地能不能认出来。`
 );
 
 if (backendUnaware.length) {
@@ -167,7 +231,24 @@ if (conflicts.length) {
       '\n以代价小的那一边为准改前端表，或者请后端改正则，两者选一，不能就这么放着。' +
       `\n后端源：${javaPath}`
   );
+}
+
+if (ordinalProblems.length) {
+  console.error(`\n[voice-intent] ✗ 后端念的序数本地认不出来（${ordinalProblems.length} 处）：`);
+  for (const problem of ordinalProblems) console.error(`  · ${problem}`);
+  console.error(
+    '\n候选消歧那一轮播的是后端的 ttsText，而用户的回答由客户端本地匹配 ——' +
+      '\n系统念一个词、本地认另一个，盲人照着念却不生效，屏幕上没有任何东西能让他发现。' +
+      '\n改前端 `ordinalForms` 跟上后端，别反过来让后端迁就前端：教用户说什么由播报那一方定。' +
+      `\n后端源：${servicePath}`
+  );
+}
+
+if (conflicts.length || ordinalProblems.length) {
   process.exit(1);
 }
 
-console.log('\n[voice-intent] 通过：本地直通表里没有一个词会被后端判成别的意图');
+console.log(
+  '\n[voice-intent] 通过：本地直通表没有一个词会被后端判成别的意图，' +
+    '后端念的每个序数本地也都认得'
+);

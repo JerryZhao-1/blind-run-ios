@@ -1,3 +1,4 @@
+import CoreLocation
 import Foundation
 
 // MARK: - Mock API Client
@@ -1283,6 +1284,11 @@ final class MockAPIClient: APIClientProtocol, @unchecked Sendable {
 
         // MARK: 本轮抽到了什么
         let place = Self.matchedVoicePlace(in: transcript, near: near)
+        // 同名候选。**只在本轮真的抽到起点时才算** —— 起点从 `current` 继承来的那几轮不该
+        // 重新弹一次消歧：用户上一轮已经挑过了，再问一遍是把他刚做的选择当没发生。
+        let startCandidates = place == nil
+            ? []
+            : Self.matchedVoiceCandidates(in: transcript, near: request)
         let endPlace = Self.matchedVoiceEndPlace(in: transcript, near: near, startSpan: Self.mockVoiceAddressSpan(in: transcript))
         let startTime = Self.mockVoiceStartTime(in: transcript)
         let minutes = Self.mockVoiceMinutes(in: transcript).flatMap { (10...300).contains($0) ? $0 : nil }
@@ -1298,9 +1304,13 @@ final class MockAPIClient: APIClientProtocol, @unchecked Sendable {
         let mergedMinutes = minutes ?? current?.durationMinutes
         // 起点：本轮抽到就三项一起用本轮的，没抽到就三项一起继承。`matchedVoicePlace` 只会返回
         // 带坐标的结果，所以起点不存在「有地名没坐标」的半状态。
-        let mergedAddress = place?.address ?? current?.address
-        let mergedLatitude = place?.latitude ?? current?.latitude
-        let mergedLongitude = place?.longitude ?? current?.longitude
+        // 平铺三项 = 候选第一项（契约：「我们的最佳猜测」，老客户端只读平铺字段也能下单）。
+        // 有候选时用候选的 `readbackAddress`，否则用表里的完整地址 —— 前者才是后端
+        // `readback(AddressCandidate)` 的形态，「挑第一个」和「挑第二个」必须拼出同一种串。
+        let bestCandidate = startCandidates.first
+        let mergedAddress = bestCandidate?.readbackAddress ?? place?.address ?? current?.address
+        let mergedLatitude = bestCandidate?.latitude ?? place?.latitude ?? current?.latitude
+        let mergedLongitude = bestCandidate?.longitude ?? place?.longitude ?? current?.longitude
         // 终点：本轮抽到地名但查不到坐标时**绝不能继承上一轮的坐标** —— 那会拼出
         // 「新地名 + 旧坐标」，名字对、位置错，而读回只念名字，盲人一个字都听不出来。
         let mergedEndAddress = endPlace?.address ?? current?.endAddress
@@ -1344,8 +1354,17 @@ final class MockAPIClient: APIClientProtocol, @unchecked Sendable {
         case .restart, .repeatBack:
             needReask = true
         default:
-            needReask = correctionTarget != nil || correctionUnclear || !missing.isEmpty
+            needReask = startCandidates.count >= 2
+                || correctionTarget != nil || correctionUnclear || !missing.isEmpty
         }
+
+        // 「说了地名、但我们没查到」。
+        //
+        // 判据是**抽到了 span 却没落成起点**，与后端同批那条改动对齐：带了坐标却一个候选都搜不到时
+        // 不再回落全国范围的正向编码（那条路曾把深圳说的地名解析到海南），直接报 true 走追问。
+        // 客户端据此在读回里说清楚，而不是静默落回「当前位置」—— 后者就是把人约到错误的起点。
+        let addressUnresolved = mergedLatitude == nil
+            && Self.mockVoiceAddressSpan(in: transcript) != nil
 
         return ParseVoiceOrderResponse(
             plannedStartTime: mergedStartTime,
@@ -1357,6 +1376,7 @@ final class MockAPIClient: APIClientProtocol, @unchecked Sendable {
             needReask: needReask,
             ttsText: Self.mockVoiceTtsText(
                 intent: intent,
+                candidates: startCandidates,
                 correctionTarget: correctionTarget,
                 correctionUnclear: correctionUnclear,
                 missing: missing
@@ -1374,7 +1394,10 @@ final class MockAPIClient: APIClientProtocol, @unchecked Sendable {
             specialNotes: current?.specialNotes,
             userIntent: intent,
             correctionTarget: correctionTarget,
-            correctionUnclear: correctionUnclear
+            correctionUnclear: correctionUnclear,
+            // 没歧义时是**空数组不是 null**（契约明说），客户端按 `count >= 2` 判这一轮是不是消歧轮。
+            candidates: startCandidates,
+            addressUnresolved: addressUnresolved
         )
     }
 
@@ -1487,6 +1510,7 @@ final class MockAPIClient: APIClientProtocol, @unchecked Sendable {
     /// 再回他一句「没听清出发地点」就是把人锁死。
     private static func mockVoiceTtsText(
         intent: VoiceUserIntent?,
+        candidates: [AddressCandidate],
         correctionTarget: VoiceCorrectionTarget?,
         correctionUnclear: Bool,
         missing: [VoiceOrderMissingSlot]
@@ -1497,6 +1521,12 @@ final class MockAPIClient: APIClientProtocol, @unchecked Sendable {
         case .repeatBack: return "好的，我再念一遍"
         case .confirm: return "好的，这就为您下单"
         default: break
+        }
+        // ⚠️ **候选消歧排在 `missing` 追问之前**（契约 `api_spec.yaml` 明说）：候选是本轮算出来的，
+        // 先追问时间的话，下一轮用户只说时间、抽不到地名，这批候选就永远消失、
+        // 起点被静默取成第一条 —— 正是这批改动要消灭的那个失败。
+        if candidates.count >= 2 {
+            return mockCandidateTts(candidates)
         }
         if !missing.isEmpty {
             return "还差\(missing.count)项没听清，可以再说一次"
@@ -1601,6 +1631,28 @@ final class MockAPIClient: APIClientProtocol, @unchecked Sendable {
         let address: String
         let latitude: Double
         let longitude: Double
+        /// 候选播报用的 POI 名与行政区（后端 `AddressCandidate.name` / `.adname`）。
+        ///
+        /// **只有同名多点的条目需要填**：候选列表只在同一个关键词命中 ≥2 条时才产生，
+        /// 而现有条目每个关键词只有一条，永远走不到那里。
+        var poiName: String?
+        var adname: String?
+
+        init(
+            keyword: String,
+            address: String,
+            latitude: Double,
+            longitude: Double,
+            poiName: String? = nil,
+            adname: String? = nil
+        ) {
+            self.keyword = keyword
+            self.address = address
+            self.latitude = latitude
+            self.longitude = longitude
+            self.poiName = poiName
+            self.adname = adname
+        }
     }
 
     /// 整句解析与单点解析共用同一份地点匹配 —— 两份会漂移，漂移了就等于 Mock 里两条语音路径行为不一致。
@@ -1617,6 +1669,70 @@ final class MockAPIClient: APIClientProtocol, @unchecked Sendable {
         // 整句里先剥壳拿地名 span，拿不到再退回整句包含匹配（单点修改那一轮用户只说地名，没有壳）。
         let haystack = mockVoiceAddressSpan(in: transcript) ?? transcript
         return candidates.first { haystack.contains($0.keyword) }
+    }
+
+    /// 同名候选（后端 2026-08-10 新增，N48）。**只有同一个关键词命中 ≥2 条时才非空。**
+    ///
+    /// 先用 `matchedVoicePlace` 定下命中的是哪个关键词，再收同名的那几条 —— 不直接
+    /// 「把所有命中的条目收起来」，是因为表里有个catch-all 条目 `("公园", "本市公园")`：
+    /// 「中山公园」会同时命中它和 `中山公园`，那样每个带「公园」的地名都会凭空多出一轮消歧，
+    /// 而线上根本没有这回事（后端是同一个 query 搜出多个同名 POI，不是模糊包含）。
+    ///
+    /// ⚠️ **带了坐标才有候选**：没有坐标就算不出 `distanceMeters`，而缺了距离的同名列表更难选
+    /// —— 这一条与后端一致（`api_spec.yaml` 的 `candidates` 字段），别在 Mock 里放宽。
+    /// 上限 3 也由后端定：纯听觉且要同时理解句子时人平均只记得住约 3 项。
+    private static func matchedVoiceCandidates(
+        in transcript: String,
+        near request: ParseVoiceOrderRequest
+    ) -> [AddressCandidate] {
+        guard let latitude = request.latitude, let longitude = request.longitude else { return [] }
+        let near = ResolveAddressRequest(
+            transcript: request.transcript, latitude: latitude, longitude: longitude
+        )
+        guard let best = matchedVoicePlace(in: transcript, near: near) else { return [] }
+        let sameName = mockVoicePlaces
+            .filter { $0.keyword == best.keyword }
+            .sorted { squaredDistance($0, near) < squaredDistance($1, near) }
+        guard sameName.count >= 2 else { return [] }
+        return sameName.prefix(3).map { place in
+            AddressCandidate(
+                name: place.poiName ?? place.keyword,
+                address: place.address,
+                adname: place.adname,
+                // 高德常常不返回商圈名，Mock 一律不给 —— 播报会退回 adname，那条分支才是常见路径。
+                business: nil,
+                distanceMeters: Int(
+                    (CLLocation(latitude: place.latitude, longitude: place.longitude)
+                        .distance(from: CLLocation(latitude: latitude, longitude: longitude)))
+                        .rounded()
+                ),
+                latitude: place.latitude,
+                longitude: place.longitude
+            )
+        }
+    }
+
+    /// 候选列表的播报文案。**逐字照抄后端 `VoiceOrderService.buildCandidateTts`**
+    /// （`demo/.../service/VoiceOrderService.java:159-181`）—— 这段话是教用户说什么的，
+    /// Mock 里念得跟线上不一样，开发期练熟的说法上真机就不生效。
+    private static func mockCandidateTts(_ candidates: [AddressCandidate]) -> String {
+        var text = "找到\(candidates.count)个地点，请说第几个。"
+        for (index, candidate) in candidates.enumerated() {
+            text += "\(VoiceOrderWizard.ordinalWords[index])，\(candidate.name)"
+            if let area = (candidate.business?.nilIfBlank ?? candidate.adname?.nilIfBlank) {
+                text += "，\(area)"
+            }
+            if let distance = candidate.distanceMeters {
+                text += "，距您\(mockDistanceText(distance))"
+            }
+            text += "。"
+        }
+        return text
+    }
+
+    /// 照抄后端 `formatDistance`：裸念「距您48000米」听不出量级，超 1 公里换单位。
+    private static func mockDistanceText(_ meters: Int) -> String {
+        meters >= 1000 ? String(format: "%.1f公里", Double(meters) / 1000) : "\(meters)米"
     }
 
     /// 从整句里剥出地名 span。取值与语料里 `field: "ADDRESS"` 的 9 条一致。
@@ -1795,6 +1911,27 @@ final class MockAPIClient: APIClientProtocol, @unchecked Sendable {
         MockVoicePlace(keyword: "颐和园", address: "北京市海淀区颐和园", latitude: 39.9999, longitude: 116.2755),
         MockVoicePlace(keyword: "朝阳公园", address: "北京市朝阳区朝阳公园", latitude: 39.9450, longitude: 116.4800),
         MockVoicePlace(keyword: "体育中心", address: "广东省深圳市福田区深圳体育中心", latitude: 22.5480, longitude: 114.0900),
+        // 同名多点 —— **唯一一组会产生候选消歧轮的条目**（后端 2026-08-10，N48）。
+        //
+        // 存在的理由不是「方便测试」：不造这一组，开发期与 demo 环境**永远走不到消歧轮**，
+        // 那段序号播报在真机手测之前没有任何人听过，而它正是这批改动的主体。
+        //
+        // 选「万象城」是因为它在语料和现有用例里 0 命中，加进来不会动任何既有断言；
+        // 而它在现实中确实是全国同名（深圳 / 杭州 / 沈阳都有），与要修的失败同型。
+        // ⚠️ **不要改用「阳光棕榈园」** —— 那个词被 `testAddressSpanIsExtractedEvenWhenTheMockCannotGeocodeIt`
+        // 反过来钉着「表里没有它」，加进去会把那条 2026-08-06 手测留下的用例弄红。
+        MockVoicePlace(
+            keyword: "万象城", address: "深圳湾大道", latitude: 22.5290, longitude: 113.9430,
+            poiName: "万象城", adname: "南山区"
+        ),
+        MockVoicePlace(
+            keyword: "万象城", address: "富春路", latitude: 30.2560, longitude: 120.2100,
+            poiName: "万象城", adname: "江干区"
+        ),
+        MockVoicePlace(
+            keyword: "万象城", address: "青年大街", latitude: 41.7550, longitude: 123.4300,
+            poiName: "万象城", adname: "和平区"
+        ),
         MockVoicePlace(keyword: "公园", address: "本市公园", latitude: 31.2304, longitude: 121.4737)
     ]
 

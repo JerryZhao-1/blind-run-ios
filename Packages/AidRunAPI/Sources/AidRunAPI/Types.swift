@@ -204,6 +204,17 @@ public protocol APIProtocol: Sendable {
     /// 地址不会整句送高德——整句进关键字接口要么返空、要么分词后命中噪声词给出错地点，
     /// 故先抽 span 再查，抽不出即报 ADDRESS 缺失。
     ///
+    /// **起点多候选（2026-08-10 新增，N48）**：请求带了坐标时，起点走 POI 周边搜索 + 拼音重排，
+    /// 搜到多个同名地点会返回 `candidates`（≥2 条）并把 ttsText 换成序号播报，
+    /// **这一轮排在 missing 的追问之前**——候选是本轮算出来的，先追问时间的话，
+    /// 下一轮用户只说时间、抽不到地名，候选就永远消失、起点被静默取成第一条。
+    /// 序数选择（「第二个」）在**客户端本地**完成，不要把那句回答发回本端点，详见 `candidates` 字段。
+    ///
+    /// ⚠️ **带了坐标却一个候选都搜不到时不再回落全国范围的正向编码**（同批修复）：
+    /// `/v3/geocode/geo` 是结构化地址接口，对 POI 简称只能分词尽力匹配 ——
+    /// 生产实测在深圳南山区说「前海万象」被拆出「前海」落到海南。现在直接报
+    /// `addressUnresolved=true` 走追问。**代价是约外地地点解析不出，收益是不会把人约到外省。**
+    ///
     /// **一步修正**：用户否定读回确认时（"不对，九点"），把上一轮结果填进 `current` 再调一次本端点。
     /// 槽位优先级 **本轮正则 > 本轮模型 > current**：新抽到的覆盖旧值，没抽到的原样继承。
     /// 继承来的值同样重跑校验（提前量可能在修正过程中失效）。**不要清空 current 让用户整句重说。**
@@ -794,6 +805,17 @@ extension APIProtocol {
     ///
     /// 地址不会整句送高德——整句进关键字接口要么返空、要么分词后命中噪声词给出错地点，
     /// 故先抽 span 再查，抽不出即报 ADDRESS 缺失。
+    ///
+    /// **起点多候选（2026-08-10 新增，N48）**：请求带了坐标时，起点走 POI 周边搜索 + 拼音重排，
+    /// 搜到多个同名地点会返回 `candidates`（≥2 条）并把 ttsText 换成序号播报，
+    /// **这一轮排在 missing 的追问之前**——候选是本轮算出来的，先追问时间的话，
+    /// 下一轮用户只说时间、抽不到地名，候选就永远消失、起点被静默取成第一条。
+    /// 序数选择（「第二个」）在**客户端本地**完成，不要把那句回答发回本端点，详见 `candidates` 字段。
+    ///
+    /// ⚠️ **带了坐标却一个候选都搜不到时不再回落全国范围的正向编码**（同批修复）：
+    /// `/v3/geocode/geo` 是结构化地址接口，对 POI 简称只能分词尽力匹配 ——
+    /// 生产实测在深圳南山区说「前海万象」被拆出「前海」落到海南。现在直接报
+    /// `addressUnresolved=true` 走追问。**代价是约外地地点解析不出，收益是不会把人约到外省。**
     ///
     /// **一步修正**：用户否定读回确认时（"不对，九点"），把上一轮结果填进 `current` 再调一次本端点。
     /// 槽位优先级 **本轮正则 > 本轮模型 > current**：新抽到的覆盖旧值，没抽到的原样继承。
@@ -3035,6 +3057,37 @@ public enum Components {
             ///
             /// - Remark: Generated from `#/components/schemas/ParseVoiceOrderResponse/correctionTarget`.
             public var correctionTarget: Components.Schemas.ParseVoiceOrderResponse.correctionTargetPayload?
+            /// **起点**的同名候选地点，**有序**。2026-08-10 新增（N48）。
+            ///
+            /// 长度 **≥2 时表示这一轮是候选消歧轮**：`ttsText` 已经是序号播报文案
+            /// （「找到3个地点，请说第几个。第一个，…」），`needReask` 为 true。
+            /// 没有候选歧义时是**空数组，不是 null**。长度恒为 0 或 2~3，不会是 1 ——
+            /// 只有一个结果还问用户选哪个，对听不见屏幕的人是纯粹的多一轮。
+            ///
+            /// **客户端要做的**：播 `ttsText` → 再收一次语音 → **在本地把「第一个 / 第二个 /
+            /// 第三个」解析成下标**（序数选择在客户端做是 SPEC B 的拍板：客户端已有本地指令表，
+            /// 后端零新增端点、零额外延迟）→ 把选中的那条写进自己的起点状态与 `current`
+            /// → 接着处理 `missing` 里剩下的项，或直接读回确认。
+            ///
+            /// ⚠️ **这一轮的用户回答不要再发回本端点**：「第二个」不是地名，模型可能把它圈成
+            /// `start_address_span`，高德查不到、按既有口径又会被保留下来，于是把 `current` 里
+            /// 刚选好的地址冲掉。消歧闭环整个留在客户端。
+            ///
+            /// ⚠️ **只有起点做多候选，终点不做**：一次播 6 项超过纯听觉工作记忆的约 3 项上限
+            /// （那也是候选截断在 3 条的原因）。终点抽错由读回念出来、用户说「终点错了」
+            /// 走 `correctionTarget` 纠正。
+            ///
+            /// ⚠️ 跨轮继承来的起点**不带候选** —— 否则用户选完还会被同一批候选再问一遍。
+            ///
+            /// 平铺的 `address`/`latitude`/`longitude` 恒等于第一项（「我们的最佳猜测」，
+            /// 与 `ResolveAddressResponse` 同一条语义），所以不消费本字段的老客户端行为不变。
+            ///
+            /// ⚠️ 只有请求带了 `latitude`/`longitude` 才可能有候选：没坐标就算不出 `distanceMeters`，
+            /// 缺了距离信息念一串同名地点只会更难选。
+            ///
+            ///
+            /// - Remark: Generated from `#/components/schemas/ParseVoiceOrderResponse/candidates`.
+            public var candidates: [Components.Schemas.AddressCandidate]?
             /// Creates a new `ParseVoiceOrderResponse`.
             ///
             /// - Parameters:
@@ -3059,6 +3112,7 @@ public enum Components {
             ///   - correctionUnclear: 用户否定了读回确认、但没说要改哪一项（只说了"不对"），**且模型也没识别出他想改什么**。
             ///   - userIntent: 用户对读回确认的**表态** —— 确认下单 / 取消 / 全部重来。没表态时为 `null`。2026-08-09 新增。
             ///   - correctionTarget: 用户点名要改的那一项 —— 他说了"改哪一项"、但**没给新值**（"我想改时间"/"终点错了"）。
+            ///   - candidates: **起点**的同名候选地点，**有序**。2026-08-10 新增（N48）。
             public init(
                 plannedStartTime: Swift.String? = nil,
                 durationMinutes: Swift.Int32? = nil,
@@ -3080,7 +3134,8 @@ public enum Components {
                 specialNotes: Swift.String? = nil,
                 correctionUnclear: Swift.Bool,
                 userIntent: Components.Schemas.ParseVoiceOrderResponse.userIntentPayload? = nil,
-                correctionTarget: Components.Schemas.ParseVoiceOrderResponse.correctionTargetPayload? = nil
+                correctionTarget: Components.Schemas.ParseVoiceOrderResponse.correctionTargetPayload? = nil,
+                candidates: [Components.Schemas.AddressCandidate]? = nil
             ) {
                 self.plannedStartTime = plannedStartTime
                 self.durationMinutes = durationMinutes
@@ -3103,6 +3158,7 @@ public enum Components {
                 self.correctionUnclear = correctionUnclear
                 self.userIntent = userIntent
                 self.correctionTarget = correctionTarget
+                self.candidates = candidates
             }
             public enum CodingKeys: String, CodingKey {
                 case plannedStartTime
@@ -3126,6 +3182,7 @@ public enum Components {
                 case correctionUnclear
                 case userIntent
                 case correctionTarget
+                case candidates
             }
         }
         /// 整句解析请求 —— 转录文本 + 可选当前坐标（同 ResolveAddressRequest）+ 可选的已确认槽位快照。
@@ -9366,6 +9423,17 @@ public enum Operations {
     ///
     /// 地址不会整句送高德——整句进关键字接口要么返空、要么分词后命中噪声词给出错地点，
     /// 故先抽 span 再查，抽不出即报 ADDRESS 缺失。
+    ///
+    /// **起点多候选（2026-08-10 新增，N48）**：请求带了坐标时，起点走 POI 周边搜索 + 拼音重排，
+    /// 搜到多个同名地点会返回 `candidates`（≥2 条）并把 ttsText 换成序号播报，
+    /// **这一轮排在 missing 的追问之前**——候选是本轮算出来的，先追问时间的话，
+    /// 下一轮用户只说时间、抽不到地名，候选就永远消失、起点被静默取成第一条。
+    /// 序数选择（「第二个」）在**客户端本地**完成，不要把那句回答发回本端点，详见 `candidates` 字段。
+    ///
+    /// ⚠️ **带了坐标却一个候选都搜不到时不再回落全国范围的正向编码**（同批修复）：
+    /// `/v3/geocode/geo` 是结构化地址接口，对 POI 简称只能分词尽力匹配 ——
+    /// 生产实测在深圳南山区说「前海万象」被拆出「前海」落到海南。现在直接报
+    /// `addressUnresolved=true` 走追问。**代价是约外地地点解析不出，收益是不会把人约到外省。**
     ///
     /// **一步修正**：用户否定读回确认时（"不对，九点"），把上一轮结果填进 `current` 再调一次本端点。
     /// 槽位优先级 **本轮正则 > 本轮模型 > current**：新抽到的覆盖旧值，没抽到的原样继承。

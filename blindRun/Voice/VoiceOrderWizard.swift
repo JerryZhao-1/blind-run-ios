@@ -32,12 +32,24 @@ final class VoiceOrderWizard: ObservableObject {
     enum Step: Equatable {
         /// 一次说完。用户在这一轮讲一整句。
         case freeform
+        /// 起点撞了同名地点，念候选让用户挑一个（后端 2026-08-10 起返回 `candidates`，N48）。
+        ///
+        /// **这是唯一一个由后端文案驱动的轮次** —— 候选列表只有后端知道
+        /// （名称、行政区、距您多少米），客户端拼不出来，所以 `prompt` 直接带着后端的 `ttsText`。
+        ///
+        /// 为什么值得为它加回一个步骤（2026-08-06 才刚删掉三个步骤）：那三个删掉的是**逐项追问**，
+        /// 用户得记住「改地点/改时间/改时长」三个指令；这一轮只要记一个序数，而且刚被念过。
+        /// 更重要的是它没有替代品 —— 不挑就只能静默取第一条，而那正是把人约到外省的那条路。
+        case disambiguateStart(candidates: [AddressCandidate], prompt: String)
         /// 读回整单后等用户的下一句：确认、改某一项、取消、重听，或整句重说。
         case confirm
 
         var speechField: SpeechInputField? {
             switch self {
             case .freeform: return .voiceOrderFreeform
+            // 复用既有的起点轮字段：逐项追问删掉之后它一直空着，而这一轮问的正是起点。
+            // 新加一个枚举值要同步 `isAllowlisted` 的白名单，白拿一处可能漏改的地方。
+            case .disambiguateStart: return .voiceOrderStartPlace
             case .confirm: return .voiceOrderConfirm
             }
         }
@@ -48,6 +60,8 @@ final class VoiceOrderWizard: ObservableObject {
             switch self {
             case .freeform:
                 return "请说你想从哪儿出发、什么时候跑、跑多久，比如：明天早上八点从人民广场出发跑一个小时。说完再点一下就好。"
+            case .disambiguateStart(_, let prompt):
+                return prompt
             case .confirm:
                 return Self.confirmOutroText
             }
@@ -409,6 +423,11 @@ final class VoiceOrderWizard: ObservableObject {
         switch step {
         case .freeform:
             await parseFreeform(transcript)
+        case .disambiguateStart(let candidates, _):
+            // 完全本地判定，一个字节都不发 —— 「第二个」不是地名，把它发回 `/parse`
+            // 会被模型圈成起点 span，高德查不到又按后端口径保留下来，
+            // 于是把刚挑好的地址冲掉（后端 `api_spec.yaml` 的 `candidates` 字段写死了这一条）。
+            chooseCandidate(from: candidates, saying: transcript)
         case .confirm:
             await handleConfirmCommand(transcript)
         }
@@ -463,8 +482,121 @@ final class VoiceOrderWizard: ObservableObject {
             notice = apply(parsed) ?? notice
         }
 
+        // 起点撞了同名地点：**先让用户挑，再读回整单**。
+        //
+        // 排在读回之前不是顺序偏好：读回念的是「我们的最佳猜测」（候选第一条），
+        // 用户听完多半就说「确认」，那批候选白算了，而如果第一条不是他要的那个，
+        // 错地点已经被确认下单 —— 而他听到的读回念得很顺，无从分辨。
+        if let parsed, let candidates = parsed.startCandidatesToDisambiguate {
+            moveToDisambiguation(candidates, prompt: parsed.ttsText, notice: notice)
+            return
+        }
+
         moveToConfirm(notice: notice)
     }
+
+    // MARK: Disambiguate start place
+
+    /// 进候选消歧轮。`prompt` 用后端的 `ttsText`（候选的名称/行政区/距离只有它知道），
+    /// 缺了才本地兜一句 —— 兜底那句念不出距离，是降级不是等价物。
+    private func moveToDisambiguation(_ candidates: [AddressCandidate], prompt: String?, notice: String?) {
+        reaskCount = 0
+        // 时长夹取之类的提示**不在这一轮说**，留到读回：候选已经占满了纯听觉能记住的约 3 项，
+        // 再往前面塞一句会把序数挤出记忆。挑完由 `moveToConfirm` 原样带出去。
+        pendingNotice = notice
+        step = .disambiguateStart(
+            candidates: candidates,
+            prompt: prompt?.nilIfBlank ?? Self.localCandidatePrompt(candidates)
+        )
+        askCurrentStep()
+    }
+
+    /// 后端 `ttsText` 缺失时的本地兜底播报。**格式跟着后端走**（「找到N个地点，请说第几个。」+ 逐条），
+    /// 否则两条路径教用户说的话不一样，而他只学得会先听到的那一种。
+    static func localCandidatePrompt(_ candidates: [AddressCandidate]) -> String {
+        let body = candidates.enumerated()
+            .map { "\(ordinalWords[$0.offset])，\($0.element.name)。" }
+            .joined()
+        return "找到\(candidates.count)个地点，请说第几个。" + body
+    }
+
+    /// 用户在消歧轮说的那一句。**全本地判定。**
+    private func chooseCandidate(from candidates: [AddressCandidate], saying transcript: String) {
+        // 出口优先：被一批他听不明白的候选卡住时，「重说」必须随时能退出去。
+        // 复用确认轮那张表，不另写一份 —— 教给用户的词只有一套才记得住。
+        if Self.command(for: transcript) == .restart {
+            restartFromFreeform()
+            return
+        }
+        guard let index = Self.ordinalIndex(in: transcript, count: candidates.count) else {
+            reaskCount += 1
+            if reaskCount >= Self.maximumReasksPerSlot {
+                // 三次没挑出来**不把人丢回表单**（那是其余轮次的降级方式）：这里手上已经有一个
+                // 可用的最佳猜测，而读回会把它念出来、用户仍然可以说「重说」。
+                // 但**必须说出「按第一个来」** —— 静默取第一条正是这轮改动要消灭的那个失败。
+                applyCandidate(candidates[0], notice: Self.pickedFirstCandidateNotice)
+                return
+            }
+            // ⚠️ **不能图省事用 `promptAndListen`**：它开头就把 `reaskCount` 清零
+            // （那是给定向追问用的「不计入重问上限」路径）。用在这里，上面那个上限永远数不到，
+            // 挑不出来的用户就被**永远关在候选列表里** —— 又一个没有出口的循环。
+            speak("没听清是第几个。请说「第一个」或者「第二个」，要重新讲就说「重说」。")
+            if let field = step.speechField {
+                listen(for: field)
+            }
+            return
+        }
+        applyCandidate(candidates[index], notice: pendingNotice)
+    }
+
+    static let pickedFirstCandidateNotice = "没听清是第几个，先按第一个来。"
+
+    private func applyCandidate(_ candidate: AddressCandidate, notice: String?) {
+        bookingViewModel?.applyVoiceResolvedStartPlace(
+            address: candidate.readbackAddress,
+            latitude: candidate.latitude,
+            longitude: candidate.longitude
+        )
+        // 快照必须跟着换：确认轮会把 `lastParsed.slotSnapshot` 当 `current` 发回 `/parse`，
+        // 不换的话后端按旧快照把起点继承成第一条，读回念的又变回最佳猜测 ——
+        // 用户刚挑的那一下就白挑了，而且没有任何提示。
+        lastParsed = lastParsed?.replacingStartPlace(with: candidate)
+        moveToConfirm(notice: notice)
+    }
+
+    /// 「第二个」→ 1。认不出返回 nil。
+    ///
+    /// **汉字这一路是实测过的，不是假设**（2026-08-06，记在 `demo/docs/handoff.md:2072-2088`）：
+    /// 「第一个」「第二个」「第三个」「就第二个吧」「选第三个」「我要第一个」**12/12 全对**，
+    /// 且加不加 `contextualStrings` 偏置**逐字相同** —— 渲染出来的是汉字「第二个」，
+    /// **不是**「第2个」。所以本地表按汉字整串匹配是对的。
+    /// 专门测这一条，是因为本仓库被同一个坑咬过：「八点钟」被识别器渲染成 `8:00`。
+    ///
+    /// ⚠️ **那批数据是合成音频**。真实人声（尤其户外）召回会掉，但**渲染形式**这一条是稳的 ——
+    /// 所以下面的阿拉伯数字写法不是「防版本漂移」（我们没有那种证据），
+    /// 而纯粹是零成本的超集：这几个串不可能是别的意思，收下不花任何东西。
+    /// 词表门禁只要求「后端念的每个词本地都认得」，本地多认几种不违反它。
+    ///
+    /// `count` 是护栏：只认真实存在的那几条。念了 2 个却认「第三个」等于让用户挑一个不存在的地点。
+    static func ordinalIndex(in transcript: String, count: Int) -> Int? {
+        let normalized = normalizedCommand(transcript)
+        guard !normalized.isEmpty else { return nil }
+        for (index, forms) in ordinalForms.enumerated() where index < count {
+            if forms.contains(where: normalized.contains) { return index }
+        }
+        return nil
+    }
+
+    /// 播报用的序数词，下标即候选下标。与后端 `VoiceOrderService.ORDINALS` 同一套写法。
+    static let ordinalWords = ["第一个", "第二个", "第三个"]
+
+    /// ⚠️ 外层顺序即判定优先级，别按字典序重排：「第二个」不含任何 index 0 的写法，
+    /// 所以从前往后扫是安全的；但把「第一」放到「第二个」后面就会先命中错的那条。
+    private static let ordinalForms: [[String]] = [
+        ["第一个", "第1个", "第一", "第1", "头一个"],
+        ["第二个", "第2个", "第二", "第2"],
+        ["第三个", "第3个", "第三", "第3"]
+    ]
 
     /// 把一次解析结果落到 view model 上。**整句轮与确认轮共用这一份** ——
     /// 跨轮修正之后确认轮也会拿到完整的合并结果，两处各写一遍迟早有一边漏掉一个槽位
@@ -528,8 +660,27 @@ final class VoiceOrderWizard: ObservableObject {
             // 所以这里直接落，不做二次清洗 —— 备注要原样给志愿者看。
             bookingViewModel?.specialNotes = notes
         }
+
+        // 「说了一个地点，但我们没查到」—— **必须说出来**，而且要和上面那条一起说，不是二选一。
+        //
+        // 起点解析不出时读回念的是「当前位置」（`startPointSummary` 的默认值），
+        // 而用户明明说了一个地名 —— 静默落回当前位置就是**把人约到错误的起点**，他全程听不出来。
+        // `addressUnresolved` 正是为了让客户端分得开「压根没说起点」和「说了但没查到」。
+        //
+        // ⚠️ 后端 2026-08-10 起不再拿全国范围的正向编码兜底（那条路曾把深圳说的地名解析到海南），
+        // 所以这个 `true` 会**变常见** —— 在此之前它几乎不出现，接不接看不出差别。
+        if parsed.resolvedStartPlace == nil, parsed.addressUnresolved == true {
+            notice = [notice, Self.startAddressUnresolvedNotice].compactMap { $0 }.joined()
+        }
         return notice
     }
+
+    /// 听见了地名却没查到时，读回前先说的那一句。
+    ///
+    /// 措辞的两条约束：**说清楚「没找到」而不是「没听到」**（我们听到了，是查不到），
+    /// 以及**说清楚起点现在是什么**（不说的话用户得从后面那句 `startPointSummary` 里自己推）。
+    static let startAddressUnresolvedNotice =
+        "没找到你说的那个地点，出发地先按当前位置来，要改就说「重说」。"
 
     /// 整句解析失败时先说的那句话。
     ///

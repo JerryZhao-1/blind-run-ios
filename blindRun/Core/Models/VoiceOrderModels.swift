@@ -119,6 +119,36 @@ enum VoiceCorrectionTarget: String, Codable, Sendable, Equatable {
     }
 }
 
+/// 同名候选地点（后端 2026-08-10 新增，N48）。
+///
+/// 后端在**请求带了坐标**时用高德 POI 周边搜索 + 拼音重排取前 3 个。没有坐标就没有候选 ——
+/// 那时后端连搜都不搜，因为算不出 `distanceMeters`，而缺了距离的同名地点列表更难选。
+struct AddressCandidate: Codable, Sendable, Equatable {
+    /// POI 名称（「五角场」），播报的主体。
+    let name: String
+    /// 街道地址（「邯郸路」），高德可能不返回。
+    let address: String?
+    /// 区县名（「杨浦区」）。
+    let adname: String?
+    /// 商圈名（「五角场商圈」），高德常常不返回。
+    let business: String?
+    /// 距请求里坐标的直线距离（米）。
+    let distanceMeters: Int?
+    let latitude: Double
+    let longitude: Double
+
+    /// 存进订单、给志愿者看的完整地址 —— **POI 名 + 街道地址**。
+    ///
+    /// ⚠️ 这条拼法**镜像后端 `VoiceOrderService.readback`**：后端返回的平铺 `address`
+    /// （= 第一个候选）就是这么拼的，用户挑了第二个之后必须拼出同样的形态，
+    /// 否则「挑第一个」和「挑第二个」两条路会得到结构不同的地址串，
+    /// 而下游 `spokenAddress` 靠空格切 POI 名 —— 形态不一致它就切错。
+    var readbackAddress: String {
+        guard let address = address?.nilIfBlank, !name.contains(address) else { return name }
+        return "\(name) \(address)"
+    }
+}
+
 /// 上一轮已确认的槽位快照。**服务端不存对话状态**，「上一轮说到哪了」完全由客户端带回来。
 ///
 /// 字段全部可选：只带已经确认过的那几项。后端的合并口径是
@@ -230,6 +260,28 @@ struct ParseVoiceOrderResponse: Codable, Sendable, Equatable {
     /// ⚠️ 用户**点了名**时这是 `false`，那一项由 `correctionTarget` 回报。
     let correctionUnclear: Bool?
 
+    // MARK: 起点候选与「说了但没查到」（后端 2026-08-10 新增，N48）
+
+    /// **起点**的同名候选，有序。长度 **≥2 = 这一轮是候选消歧轮**；没歧义时后端发空数组。
+    ///
+    /// 长度恒为 0 或 2~3，**不会是 1** —— 只有一个结果还问用户选哪个，
+    /// 对听不见屏幕的人是纯粹的多一轮。
+    ///
+    /// ⚠️ **终点永远没有候选**：一次播 6 项超过纯听觉工作记忆的约 3 项上限。
+    /// 终点抽错走读回 + `correctionTarget == .endAddress`。
+    let candidates: [AddressCandidate]?
+
+    /// 「听见了一个地名，但没能把它变成可用的起点」。
+    ///
+    /// 仅在 `missing` 含 `.address` 时有意义。区分两件对用户来说**该做的事完全相反**的情况：
+    /// - `true` —— 用户**确实说了**一个地点，是我们没解析出来。此时静默把起点落回「当前位置」
+    ///   就是**把人约到错误的起点**，必须说出来。
+    /// - `false` —— 两道抽取都没拿到地名，用户很可能压根没说起点，落回当前位置是对的。
+    ///
+    /// ⚠️ 2026-08-10 起这个 `true` 会**变常见**：后端不再把搜不到的地名丢给全国范围的正向编码
+    /// （那条路径曾把深圳说的地名解析到海南），改成诚实认输。所以这个字段从「可以不接」变成必须接。
+    let addressUnresolved: Bool?
+
     // MARK: 额外需求槽位（可选，2026-08-04 后端新增）
     //
     // 三者都是「抽不出不追问」的可选槽位：解析不出不会进 `missing`，也不会单独触发大模型兜底
@@ -275,7 +327,9 @@ struct ParseVoiceOrderResponse: Codable, Sendable, Equatable {
         specialNotes: String? = nil,
         userIntent: VoiceUserIntent? = nil,
         correctionTarget: VoiceCorrectionTarget? = nil,
-        correctionUnclear: Bool? = nil
+        correctionUnclear: Bool? = nil,
+        candidates: [AddressCandidate]? = nil,
+        addressUnresolved: Bool? = nil
     ) {
         self.plannedStartTime = plannedStartTime
         self.durationMinutes = durationMinutes
@@ -295,6 +349,8 @@ struct ParseVoiceOrderResponse: Codable, Sendable, Equatable {
         self.userIntent = userIntent
         self.correctionTarget = correctionTarget
         self.correctionUnclear = correctionUnclear
+        self.candidates = candidates
+        self.addressUnresolved = addressUnresolved
     }
 
     /// 起点三项要么全有要么当没抽到 —— 只有地址没有坐标下不了单，只有坐标没有地址读回时没法念。
@@ -311,6 +367,46 @@ struct ParseVoiceOrderResponse: Codable, Sendable, Equatable {
     var resolvedEndPlace: BookingEndPlace? {
         guard let address = endAddress?.nilIfBlank else { return nil }
         return BookingEndPlace(address: address, latitude: endLatitude, longitude: endLongitude)
+    }
+
+    /// 需要让用户挑一个的候选；不需要消歧时为 `nil`。
+    ///
+    /// 判据只看**数量 ≥2**，不看 `needReask`：后端在这一轮同时可能报 `missing`
+    /// （时间/时长还没说），而 `needReask` 那时也为 true —— 两者混在一起分不出「该消歧」
+    /// 还是「该追问」。数量是这一轮唯一无歧义的信号。
+    var startCandidatesToDisambiguate: [AddressCandidate]? {
+        guard let candidates, candidates.count >= 2 else { return nil }
+        return candidates
+    }
+
+    /// 用户在消歧轮挑定一条之后的结果：**起点三项换成他挑的那个，其余字段逐字不变**。
+    ///
+    /// `candidates` 清空是必须的，不是顺手 —— 留着的话，这份结果被存进 `lastParsed`、
+    /// 下一轮又被 `startCandidatesToDisambiguate` 读到，用户会为同一批候选被问第二遍。
+    func replacingStartPlace(with candidate: AddressCandidate) -> ParseVoiceOrderResponse {
+        ParseVoiceOrderResponse(
+            plannedStartTime: plannedStartTime,
+            durationMinutes: durationMinutes,
+            address: candidate.readbackAddress,
+            latitude: candidate.latitude,
+            longitude: candidate.longitude,
+            missing: missing,
+            needReask: needReask,
+            ttsText: ttsText,
+            endAddress: endAddress,
+            endLatitude: endLatitude,
+            endLongitude: endLongitude,
+            endAddressUnresolved: endAddressUnresolved,
+            hasGuideDog: hasGuideDog,
+            pacePreference: pacePreference,
+            specialNotes: specialNotes,
+            userIntent: userIntent,
+            correctionTarget: correctionTarget,
+            correctionUnclear: correctionUnclear,
+            candidates: [],
+            // 挑定了就等于有坐标了，「说了但没查到」不再成立
+            addressUnresolved: false
+        )
     }
 
     /// 下一轮 `/parse` 要回传的 `current`。
