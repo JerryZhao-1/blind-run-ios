@@ -24,14 +24,12 @@ final class CompletedTrackSummaryViewModel: ObservableObject {
     }
 }
 
+/// 订单详情里内嵌的轨迹摘要 —— 对标 Strava 列表页那个压缩版式（窄地图 + 一行统计），
+/// 大屏回放在 `OrderRouteReplayView`，由下面那条链接进入。
 struct CompletedTrackSummaryView: View {
     let track: OrderTrackResponse
+    let orderID: Int64
     let repeatSummary: () -> Void
-
-    private var routeOverlay: [MapPolylineItem] {
-        guard track.primaryRouteCoordinates.count >= 2 else { return [] }
-        return [MapPolylineItem(id: "blind-primary-route", coordinates: track.primaryRouteCoordinates, isPrimary: true)]
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -42,20 +40,25 @@ struct CompletedTrackSummaryView: View {
             if let emptyText = track.emptyStateText {
                 Text(emptyText).font(AppFonts.body())
             } else {
-                if let first = track.primaryRouteCoordinates.first {
-                    MapViewWrapper(
-                        centerCoordinate: first,
-                        showsUserLocation: false,
-                        polylines: routeOverlay,
-                        tracksUserLocation: false,
-                        animatesCenterChanges: false
-                    )
+                TrackRouteMap(track: track)
                     .frame(height: 220)
                     .clipShape(RoundedRectangle(cornerRadius: 16))
                     .accessibilitySortPriority(-1)
                     .accessibilityIdentifier("completedTrackAuxiliaryMap")
+
+                TrackStatsRow(stats: track.blindStats)
+
+                // 独立成行而不是把地图本身做成链接：`MAMapView` 自己吃掉平移手势，
+                // 包在 NavigationLink 里点不动。这一行同时也是读屏用户唯一能对上的入口。
+                NavigationLink {
+                    OrderRouteReplayView(orderID: orderID, preloadedTrack: track)
+                } label: {
+                    Label("查看大图路线", systemImage: "map")
+                        .font(AppFonts.body())
                 }
-                summaryRows
+                .frame(minHeight: 44)
+                .accessibilityHint("全屏查看本次跑步轨迹")
+                .accessibilityIdentifier("completedTrackFullScreenLink")
             }
 
             Button("重复当前状态", action: repeatSummary)
@@ -65,22 +68,5 @@ struct CompletedTrackSummaryView: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("completedTrackSummary")
-    }
-
-    @ViewBuilder
-    private var summaryRows: some View {
-        if let value = track.blindStats.distanceText { summaryRow("里程", value) }
-        if let value = track.blindStats.durationText { summaryRow("时长", value) }
-        if let value = track.blindStats.averagePaceText { summaryRow("平均配速", value) }
-    }
-
-    private func summaryRow(_ title: String, _ value: String) -> some View {
-        HStack {
-            Text(title).foregroundStyle(.secondary)
-            Spacer()
-            Text(value).fontWeight(.semibold)
-        }
-        .font(AppFonts.body())
-        .accessibilityElement(children: .combine)
     }
 }

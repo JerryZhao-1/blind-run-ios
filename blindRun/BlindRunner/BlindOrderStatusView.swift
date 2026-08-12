@@ -685,7 +685,7 @@ struct BlindOrderStatusView: View {
                 .accessibilityAddTraits(.isHeader)
 
             if let track = trackViewModel.track {
-                CompletedTrackSummaryView(track: track) {
+                CompletedTrackSummaryView(track: track, orderID: orderId) {
                     speechService.speak(track.spokenSummary)
                 }
             } else if trackViewModel.isLoading {

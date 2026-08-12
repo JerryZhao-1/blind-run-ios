@@ -688,6 +688,7 @@ struct VolunteerOrderDetailView: View {
     @EnvironmentObject private var locationService: LocationService
     @Environment(\.dismiss) private var dismiss
     @StateObject private var viewModel = VolunteerOrderDetailViewModel()
+    @StateObject private var trackViewModel = CompletedTrackSummaryViewModel()
     @State private var showAcceptConfirm = false
     @State private var showCancelConfirm = false
     @State private var serviceNavigationOrder: OrderDetailResponse?
@@ -706,6 +707,10 @@ struct VolunteerOrderDetailView: View {
                     VolunteerOrderMap(order: order)
                     VolunteerBlindRunnerInfoCard(order: order, showPhone: viewModel.canShowPhone)
                     VolunteerOrderInfoSection(order: order, distanceText: distanceText(for: order))
+                    // 这一页是志愿者首页「近期服务」点进来的落点。此前它没有轨迹，
+                    // 而「服务记录」点进来的 `VolunteerReadOnlyOrderView` 有 ——
+                    // 同一个已完成订单换个入口就看不到路线，用户报的就是这个。
+                    completedTrackSection(order)
                     actionSection(order)
                 }
 
@@ -749,6 +754,9 @@ struct VolunteerOrderDetailView: View {
             locationService.requestPermission()
             locationService.startUpdating()
             await viewModel.load(orderId: orderId)
+            if viewModel.order?.status == .completed {
+                await trackViewModel.load(orderID: orderId, appState: appState)
+            }
         }
         .onChange(of: viewModel.order?.status) { status in
             guard status?.isActiveForVolunteer == true,
@@ -796,6 +804,27 @@ struct VolunteerOrderDetailView: View {
         ) {
             if let order = serviceNavigationOrder {
                 VolunteerInServiceView(orderId: order.orderId, initialOrder: order)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func completedTrackSection(_ order: OrderDetailResponse) -> some View {
+        if order.status == .completed {
+            if let track = trackViewModel.track {
+                CompletedTrackSummaryView(track: track, orderID: order.orderId) {
+                    speechService.speak(track.spokenSummary)
+                }
+            } else if trackViewModel.isLoading {
+                ProgressView("正在加载本次路线")
+                    .accessibilityLabel("正在加载本次路线")
+                    .accessibilityIdentifier("volunteerOrderDetailTrackLoading")
+            } else if let message = trackViewModel.errorMessage {
+                // 轨迹拉不到不该把整页判成失败：订单信息和联系方式仍然有用。
+                Text(message)
+                    .font(AppFonts.body())
+                    .foregroundColor(AppColors.textSecondary)
+                    .accessibilityLabel(message)
             }
         }
     }
@@ -1566,7 +1595,7 @@ struct VolunteerInServiceView: View {
     private var completedTrackContent: some View {
         ScrollView {
             if let track = trackViewModel.track {
-                CompletedTrackSummaryView(track: track) {
+                CompletedTrackSummaryView(track: track, orderID: orderId) {
                     speechService.speak(track.spokenSummary)
                 }
                 .padding(20)
@@ -2638,7 +2667,7 @@ struct VolunteerReadOnlyOrderView: View {
                 VolunteerBlindRunnerInfoCard(order: order, showPhone: order.status != .pendingMatch && order.blindPhone?.trimmed.isEmpty == false)
                 VolunteerOrderInfoSection(order: order, distanceText: nil)
                 if order.status == .completed, let track = trackViewModel.track {
-                    CompletedTrackSummaryView(track: track) {
+                    CompletedTrackSummaryView(track: track, orderID: order.orderId) {
                         speechService.speak(track.spokenSummary)
                     }
                 } else if trackViewModel.isLoading {

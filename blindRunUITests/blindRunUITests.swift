@@ -248,6 +248,20 @@ final class blindRunUITests: XCTestCase {
             routeMap.frame.minY,
             "Textual status must precede the auxiliary map"
         )
+
+        // 内嵌那张 220pt 的图看不清整条路线，大屏页才是「跑完看轨迹」的落点。
+        // 入口做成独立一行而不是把地图本身变成链接：MAMapView 自己吃掉手势，
+        // 包在 NavigationLink 里点不动，读屏用户也对不上焦点。
+        let fullScreenLink = app.descendants(matching: .any)["completedTrackFullScreenLink"].firstMatch
+        XCTAssertTrue(fullScreenLink.waitForExistence(timeout: 5), "Track summary must offer a full-screen route entry")
+        fullScreenLink.tap()
+
+        let replay = app.descendants(matching: .any)["orderRouteReplay"].firstMatch
+        XCTAssertTrue(replay.waitForExistence(timeout: 10), "Tapping the entry should open the full-screen route replay")
+        XCTAssertTrue(
+            app.descendants(matching: .any)["routeReplayRepeatStatus"].firstMatch.waitForExistence(timeout: 5),
+            "The replay page must stay usable without inspecting the map"
+        )
     }
 
     @MainActor

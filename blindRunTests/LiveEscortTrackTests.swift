@@ -229,6 +229,47 @@ final class LiveEscortTrackTests: XCTestCase {
         XCTAssertNil(response.blindStats.avgPaceSecPerKm)
     }
 
+    /// 地图中心必须是外接矩形中心，不能是起点 —— 传起点时 `AMapContainer` 的重定位
+    /// 会持续覆盖折线的 fit，路线跑出屏幕，现象就是「点进去看不到轨迹」。
+    /// 这条钉的是「中心不等于起点，且落在轨迹的经纬度跨度之内」。
+    func testPrimaryRouteBoundingCenterIsRouteCenterNotStartPoint() throws {
+        let json = #"{"status":"COMPLETED","volunteerTrack":[],"volunteerStats":{"distanceMeters":null,"durationSeconds":null,"avgPaceSecPerKm":null},"blindTrack":[{"lat":39.900,"lng":116.400,"recordedAt":"2026-07-21T08:00:00Z"},{"lat":39.940,"lng":116.470,"recordedAt":"2026-07-21T08:10:00Z"},{"lat":39.920,"lng":116.500,"recordedAt":"2026-07-21T08:20:00Z"}],"blindStats":{"distanceMeters":5200,"durationSeconds":1200,"avgPaceSecPerKm":230}}"#
+        let response = try JSONDecoder().decode(OrderTrackResponse.self, from: Data(json.utf8))
+        let center = try XCTUnwrap(response.primaryRouteBoundingCenter)
+        let start = try XCTUnwrap(response.primaryRouteCoordinates.first)
+
+        // 纬度跨度 39.900–39.940，经度跨度 116.400–116.500
+        XCTAssertEqual(center.latitude, 39.920, accuracy: 1e-9)
+        XCTAssertEqual(center.longitude, 116.450, accuracy: 1e-9)
+
+        // `AMapContainer` 的重定位阈值是 1e-4 度；中心与起点的差必须**大于**它，
+        // 否则这个属性等于没做事。
+        XCTAssertGreaterThan(abs(center.latitude - start.latitude), 1e-4)
+        XCTAssertGreaterThan(abs(center.longitude - start.longitude), 1e-4)
+    }
+
+    func testBoundingCenterIsNilForEmptyTrackAndExactForSinglePoint() throws {
+        let empty = OrderTrackResponse(
+            status: .completed,
+            volunteerTrack: [],
+            volunteerStats: TrackStats(distanceMeters: nil, durationSeconds: nil, avgPaceSecPerKm: nil),
+            blindTrack: [],
+            blindStats: TrackStats(distanceMeters: nil, durationSeconds: nil, avgPaceSecPerKm: nil)
+        )
+        XCTAssertNil(empty.primaryRouteBoundingCenter)
+
+        let single = OrderTrackResponse(
+            status: .completed,
+            volunteerTrack: [],
+            volunteerStats: TrackStats(distanceMeters: nil, durationSeconds: nil, avgPaceSecPerKm: nil),
+            blindTrack: [TrackPoint(lat: 39.9, lng: 116.4, recordedAt: "2026-07-21T08:00:00Z")],
+            blindStats: TrackStats(distanceMeters: nil, durationSeconds: nil, avgPaceSecPerKm: nil)
+        )
+        let center = try XCTUnwrap(single.primaryRouteBoundingCenter)
+        XCTAssertEqual(center.latitude, 39.9, accuracy: 1e-9)
+        XCTAssertEqual(center.longitude, 116.4, accuracy: 1e-9)
+    }
+
     func testPolylineIdentityAndSignatureAreStable() {
         let coordinates = [
             CLLocationCoordinate2D(latitude: 39.9, longitude: 116.4),

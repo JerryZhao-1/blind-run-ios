@@ -11,6 +11,10 @@ enum MapAnnotationKind: Equatable, Sendable {
     case currentLocation
     case peer
     case generic
+    /// 历史轨迹的两端。与 `orderStart` 分开：那个标的是订单**约定**的出发地，
+    /// 这两个标的是实际**跑出来**的第一个和最后一个轨迹点，两者可以差出几百米。
+    case routeStart
+    case routeEnd
 }
 
 struct MapAnnotationItem: Identifiable {
@@ -303,6 +307,11 @@ private extension MapAnnotationKind {
             return .purple
         case .generic:
             return .purple
+        // 绿起红终是跑步类产品的通用约定，不自创配色。
+        case .routeStart:
+            return .green
+        case .routeEnd:
+            return .red
         }
     }
 }

@@ -51,6 +51,32 @@ struct OrderTrackResponse: Codable, Sendable, Equatable {
         blindTrack.compactMap { $0.backendCoordinate?.coordinate }
     }
 
+    /// 轨迹外接矩形的中心，给地图当 `centerCoordinate` 用。
+    ///
+    /// **不能传起点。** `AMapContainer` 一边在折线落地时 fit 到外接矩形
+    /// （`AMapContainer.swift:185-192`），一边在每次 `updateUIView` 里把地图中心拉回传入坐标
+    /// （`:102-110`，阈值 1e-4 度）。传起点的话后者会持续覆盖前者，
+    /// 结果是路线只剩起点附近一小段留在屏幕上 —— 看起来就像「轨迹没画出来」。
+    ///
+    /// 用经纬度算术中心而不是 `MAMapRect` 的墨卡托中心：两者的纬度差在城市尺度下约 1e-5 度，
+    /// 比上面那个阈值小一个数量级，够不着触发条件。
+    var primaryRouteBoundingCenter: CLLocationCoordinate2D? {
+        let coordinates = primaryRouteCoordinates
+        guard let first = coordinates.first else { return nil }
+        var minLat = first.latitude, maxLat = first.latitude
+        var minLng = first.longitude, maxLng = first.longitude
+        for point in coordinates.dropFirst() {
+            minLat = min(minLat, point.latitude)
+            maxLat = max(maxLat, point.latitude)
+            minLng = min(minLng, point.longitude)
+            maxLng = max(maxLng, point.longitude)
+        }
+        return CLLocationCoordinate2D(
+            latitude: (minLat + maxLat) / 2,
+            longitude: (minLng + maxLng) / 2
+        )
+    }
+
     var emptyStateText: String? {
         guard blindTrack.count < 2 else { return nil }
         switch status {
