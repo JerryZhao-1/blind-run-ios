@@ -85,6 +85,15 @@ struct LegalFallbackDocumentView<Footer: View>: View {
                             .foregroundColor(AppColors.textPrimary)
                             .accessibilityLabel(bullet)
                     }
+                    // 第三方 SDK 的隐私政策要「用户可点击」（#355）。读屏念标题 + 「链接」，双击打开。
+                    ForEach(Array(section.links.enumerated()), id: \.offset) { _, link in
+                        Link(destination: link.url) {
+                            Text(link.title)
+                                .font(AppFonts.body())
+                                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                        }
+                        .accessibilityHint("在浏览器里打开")
+                    }
                 } header: {
                     Text(section.heading)
                         .accessibilityAddTraits(.isHeader)

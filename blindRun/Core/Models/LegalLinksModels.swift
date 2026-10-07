@@ -109,7 +109,18 @@ enum LegalFallbackCopy {
         let heading: String
         /// 每条单独成段，VoiceOver 可逐条浏览。
         let bullets: [String]
+        /// 排在本节末尾、可以点开的链接。第三方 SDK 的隐私政策必须「透出且用户可点击」（高德合规方案原话），
+        /// 写成正文里的一串网址点不开。
+        var links: [Link] = []
     }
+
+    struct Link: Equatable, Sendable {
+        let title: String
+        let url: URL
+    }
+
+    static let amapPrivacyURL = URL(string: "https://lbs.amap.com/pages/privacy/")!
+    static let aliyunCloudAuthPrivacyURL = URL(string: "https://terms.aliyun.com/legal-agreement/terms/suit_bu1_ali_cloud/suit_bu1_ali_cloud202107281509_18386.html")!
 
     struct Document: Equatable, Sendable {
         let title: String
@@ -160,6 +171,28 @@ enum LegalFallbackCopy {
                     "仅用于完成陪跑服务的匹配、进行和结束。",
                     "服务开始后，向已接单的志愿者展示视障跑者的联系方式；接单前不展示。",
                     "不用于广告投放，不向第三方出售个人信息。"
+                ]
+            ),
+            // #355：首启告知第 5 条指向这一节。字段逐项取自厂商原文（2026-10-07 核，
+            // 见 `docs/research/third-party-sdk-disclosure-ios-20261007.md`），**别照抄安卓那份** ——
+            // 高德 iOS 合包的收集项与安卓不同（没有 Wi-Fi、基站、IP），且本应用用的是 NO-IDFA 基础库。
+            // SDK 换版本、换 pod、开关扩展功能时回那两页重核这一节。
+            Section(
+                heading: "第三方 SDK",
+                bullets: [
+                    "高德开放平台地图 SDK（含定位、搜索），提供方：北京高德图强科技有限公司。",
+                    "使用目的：为你提供地图展示、定位和地址搜索。",
+                    "收集的个人信息：经纬度、搜索词、传感器信息（矢量、加速度、压力）、当前应用信息（应用名、应用版本号）、设备参数及系统信息（设备品牌及型号、操作系统、运营商信息、屏幕分辨率）。本应用使用的是不采集 IDFA（广告标识符）的版本。",
+                    "收集方式：SDK 在你的手机上采集，发送给高德的服务器，用于计算位置和返回地图、搜索结果。",
+                    "高德的「安全保障」和「数据用于统计分析」两项扩展功能，本应用都没有开启。",
+                    "阿里云金融级实人认证 SDK，提供方：杭州阿里云智能科技有限公司。只在志愿者做人脸核验时使用。",
+                    "使用目的：核验志愿者是不是本人，识别虚假设备。",
+                    "收集的个人信息：姓名、身份证号、人脸图片和视频流；设备基础信息（设备制造商、品牌、类型及型号、名称、操作系统、内存及存储大小、电池及电量、基带、开机时间、屏幕亮度及分辨率、CPU、时区、语言、充电状态、系统内核、传感器列表、光线传感器）、设备标识（IDFV）、网络信息（BSSID、SSID、运营商、网络类型、SIM 卡状态）、本应用的名称、版本和安装时间，以及核验过程的操作日志。",
+                    "收集方式：SDK 在你的手机上采集，发送给阿里云的服务器完成核验。"
+                ],
+                links: [
+                    Link(title: "高德地图开放平台隐私权政策", url: amapPrivacyURL),
+                    Link(title: "阿里云金融级实人认证 SDK 隐私政策", url: aliyunCloudAuthPrivacyURL)
                 ]
             ),
             Section(

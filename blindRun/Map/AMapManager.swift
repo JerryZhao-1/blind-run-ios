@@ -60,6 +60,12 @@ enum AMapManager {
         AMapSearchAPI.updatePrivacyAgree(.didAgree)
         AMapLocationManager.updatePrivacyShow(.didShow, privacyInfo: .didContain)
         AMapLocationManager.updatePrivacyAgree(.didAgree)
+        // 高德两项扩展功能（安全保障、数据用于统计分析）按高德合规方案「由开发者提供给用户选择」；
+        // 我们没问过用户，而统计分析的用途原文含「帮助优化广告投放营销效果」，与首启告知「不做广告」冲突。
+        // 🔴 iOS 基础库里两者**默认 YES**（`AMapServices.h`：「默认为YES。since 1.8.7」），与安卓默认关相反 ——
+        // 不显式关，隐私政策里「两项都没有开启」那句就是假的（#355）。
+        AMapServices.shared().securityAgree = false
+        AMapServices.shared().analysisAgree = false
     }
 
     private static func resolveAPIKey() -> String? {

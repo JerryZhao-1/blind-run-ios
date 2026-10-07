@@ -58,7 +58,7 @@ enum PrivacyConsentPurpose: String, CaseIterable, Sendable {
     /// （`CURRENT_PROJECT_VERSION` 至今为 1，没有上传过 TestFlight），所以回退零影响。
     var disclosureVersion: Int {
         switch self {
-        case .appLaunch: return 2
+        case .appLaunch: return 3
         case .blindIdentity: return 1
         case .volunteerIdentity: return 1
         case .blindVisionProfile: return 1
@@ -92,13 +92,19 @@ enum PrivacyConsentPurpose: String, CaseIterable, Sendable {
                 // 旧同意没有覆盖到 —— 与 09-10 那次「换分类说法」性质相反。独立一条是为了
                 // 读屏用户把它当成单独的焦点听到，而不是埋在位置那句里。
                 "陪跑服务进行中，手机的运动传感器还会记录你的步数、步频和爬升高度，跑完后只显示在你自己的跑步记录里，另一方看不到。不同意「运动与健身」权限也不影响陪跑。",
+                // 2026-10-07 加入高德 SDK（#355，与安卓 #54 逐字一致，负责人同意）。**+1 `disclosureVersion`（2 → 3）**：
+                // 新的接收方。`AMapManager.configurePrivacyCompliance` 一直在向高德声明「告知已含高德条款」，此前不属实。
+                // 细项在内置隐私政策「第三方 SDK」一节（按高德 iOS 地图合包条目列）。
+                // ⚠️ 「Wi-Fi、基站」是安卓合包的收集项，高德 iOS 条目里没有 —— 这句按负责人要求与安卓逐字一致，偏差已在 #355 提出。
+                "地图、定位和地址搜索由高德开放平台 SDK（北京高德图强科技有限公司）提供。为此它会在你的手机上收集位置、搜索词，以及 Wi-Fi、基站、传感器等设备与网络信息，发送给高德的服务器。详见隐私政策「第三方 SDK」一节。",
                 // 2026-09-10 加入「视力状况」。**刻意不 +1 `disclosureVersion`**：
                 // 按本文件上面那条判据，+1 的触发条件是「告知的**处理行为**变没变」——
                 // 这两个字段的收集、用途、接收方、保留规则一个字节都没改，
                 // 变的只是我们把它的**分类**说准了（PIPL 第二十八条「特定身份」）。
                 // 属于「换一种说法」那一档 ⇒ 只更新指纹用例，不把老用户拦回同意页重来一次。
                 "身份证号、人脸、位置轨迹和视力状况属于敏感个人信息。到收集它们的那一步，我们会再单独问你一次。",
-                "这些信息只用于完成陪跑服务，不做广告、不卖给第三方。你随时可以在设置里删除账户：实名资料、紧急联系人、运动轨迹和跑步记录会被删除。",
+                // 「不卖给第三方」→「不出售给任何人」：上一条刚说第三方 SDK 会收集，原措辞读起来像自相矛盾；承诺的实质不变。
+                "这些信息只用于完成陪跑服务，不做广告、不出售给任何人。你随时可以在设置里删除账户：实名资料、紧急联系人、运动轨迹和跑步记录会被删除。",
                 "订单、评价和求助记录会保留用于纠纷复核。里面仍有每次陪跑的起终点位置、你填写的备注和求助时的位置，但没有你的姓名、身份证号和紧急联系人。"
             ]
         case .blindIdentity:
@@ -179,7 +185,8 @@ enum PrivacyConsentPurpose: String, CaseIterable, Sendable {
         switch self {
         case .appLaunch:
             return "助盲跑会收集你的手机号、位置、语音和运动数据；实名认证时还会收集身份证号，志愿者另需人脸核验。"
-                + "这些信息只用于陪跑服务，不做广告、不卖给第三方。"
+                + "地图、定位和地址搜索由高德开放平台 SDK 提供。"
+                + "这些信息只用于陪跑服务，不做广告、不出售给任何人。"
                 + "身份证号、人脸、位置轨迹和视力状况属于敏感个人信息，收集前会再单独问你。"
         case .blindIdentity, .volunteerIdentity, .blindVisionProfile:
             return nil
